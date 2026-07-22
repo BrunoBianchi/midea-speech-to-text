@@ -1,1 +1,17 @@
 node_modules/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Env
+.env
+
+# Audio samples
+**/Samples/
+**/Samples/**
+# Downloaded model weights
+**/pre-trained-models/
+
+**/prompt.md
