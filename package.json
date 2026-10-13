@@ -1,0 +1,19 @@
+{
+  "devDependencies": {
+    "semantic-release": "^25.0.9"
+  },
+  "scripts": {
+    "prepare": "husky"
+  },
+  "version": "0.0.0-PLACEHOLDER",
+  "release": {
+    "branches": [
+      "main"
+    ],
+    "plugins": [
+      "@semantic-release/commit-analyzer",
+      "@semantic-release/release-notes-generator",
+      "@semantic-release/github"
+    ]
+  }
+}
