@@ -5,3 +5,8 @@ librosa
 soundfile 
 pydub 
 pydantic
+
+# Test frameworks (Task 1)
+pytest
+pytest-asyncio
+hypothesis
