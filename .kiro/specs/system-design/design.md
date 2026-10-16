@@ -5,7 +5,7 @@
 
 Este documento descreve o design técnico de alto nível do sistema **Midea Speech-to-Text & Call Center Intelligence**, uma prova de conceito (PoC) para processamento, transcrição (speech-to-text), diarização e auditoria inteligente de gravações do call center de suporte técnico da Midea. O sistema é **assíncrono, orientado a eventos e baseado em microsserviços**, com mensageria via RabbitMQ/Redis, um **Retry System nativo** e tolerância a falhas.
 
-A arquitetura-alvo completa se organiza em três fluxos de processamento (Workers): **Redução de Ruído**, **Transcrição** e **Decisão por IA**. Todo o stack é **100% open source** e projetado para operar **localmente/offline**.
+A arquitetura-alvo completa se organiza em três fluxos de processamento (Workers): **Redução de Ruído**, **Transcrição** e **Decisão por IA**. A lane de IA é apoiada por um **RAG (Retrieval-Augmented Generation) local/offline sobre os scripts/protocolos de atendimento de referência**, que fornece ao AI Worker o contexto do roteiro que os atendentes deveriam seguir, fundamentando a **validação de aderência ao script**. Todo o stack é **100% open source** e projetado para operar **localmente/offline**.
 
 Este documento cobre a **primeira fatia (first slice)** do design, intencionalmente mais simples que o pipeline completo. O foco é o **sistema de backend inicial**: ponto de entrada → Kubernetes Ingress (exposição de borda) → Gateway/Orquestrador Node.js (entrada HTTP, recebimento do upload, balanceamento/roteamento para os contêineres FastAPI e orquestração das lanes) → contêineres FastAPI (Docker) → mensageria RabbitMQ (direct-exchange com routing keys) → persistência em MongoDB → notificações ao dashboard via SSE/callback. A ingestão de áudio ocorre sempre via API/gateway (nunca com acesso direto aos workers). Os três workflows e o Retry System são tratados em **nível conceitual**, acomodando a arquitetura-alvo sem detalhar os internals de ML de cada worker.
 
@@ -82,6 +82,8 @@ graph TD
         WA[AI Worker<br/>Modelo de Decisao]
     end
 
+    RAG[(RAG<br/>Base de Scripts dos Atendentes<br/>local / offline)]
+
     RETRY[Retry System<br/>+ Dead Letter]
     REDIS[(Redis<br/>cache / estado efemero)]
 
@@ -103,6 +105,8 @@ graph TD
     QN --> WN
     QT --> WT
     QA --> WA
+
+    RAG -.->|recupera contexto do script<br/>somente leitura| WA
 
     WN -->|Processed Audio| GW
     WT -->|Diarized text sem PII| GW
@@ -135,6 +139,8 @@ graph LR
     QA --> WA[Noise Worker]
     QT --> WT[Transcript Worker]
     QI --> WI[AI Worker]
+
+    RAG[(RAG<br/>Base de Scripts<br/>local / offline)] -.->|recupera contexto<br/>somente leitura| WI
 
     WA --> DA{Fail?}
     WT --> DT{Fail?}
@@ -179,13 +185,13 @@ graph TD
 
 ### Componente 1: Gateway + Orquestrador (Node.js)
 
-**Propósito**: Ponto de entrada HTTP único da aplicação e coordenador do fluxo assíncrono. Atua como gateway/reverse proxy à frente das réplicas FastAPI e, simultaneamente, como orquestrador das três lanes. É exposto externamente pelo Kubernetes Ingress/Service (borda L4/edge), mas o balanceamento lógico entre os contêineres FastAPI é feito pelo próprio gateway Node.js.
+**Propósito**: Ponto de entrada HTTP único da aplicação e coordenador do fluxo assíncrono. É o **único** componente exposto na borda (via Kubernetes Ingress/Service, que faz exposição de borda + terminação TLS). Atua como **reverse proxy / balanceador em nível de aplicação** à frente das réplicas FastAPI, como **único produtor de mensagens para o `direct-exchange`** e, simultaneamente, como **sequenciador das três lanes**. O Ingress/Service do Kubernetes apenas expõe este gateway na borda; o balanceamento lógico entre os contêineres FastAPI é feito pelo próprio gateway Node.js.
 
 **Responsabilidades**:
 - Receber o **upload de áudio** do frontend (ingestão sempre via API/gateway, nunca acesso direto aos workers).
-- Realizar o **balanceamento/roteamento** das requisições em nível de aplicação (reverse proxy) para os contêineres FastAPI.
-- Publicar mensagens no `direct-exchange` com a routing key apropriada (`routingKey.audio`, `routingKey.transcript`, `routingKey.AI`).
-- Sequenciar as etapas (Ruído → Transcrição → IA) conforme os resultados retornam.
+- Realizar o **balanceamento/roteamento** das requisições em nível de aplicação (reverse proxy) para os contêineres FastAPI disponíveis, considerando um contêiner disponível apenas quando responde à verificação de prontidão dentro do limite definido.
+- Ser o **único produtor** de mensagens para o `direct-exchange`, publicando exclusivamente com uma das routing keys válidas (`routingKey.audio`, `routingKey.transcript`, `routingKey.AI`) conforme a lane de destino.
+- Sequenciar as etapas (Ruído → Transcrição → IA) conforme os resultados retornam, usando `workflow_states` como fonte de verdade.
 - Escrever/atualizar o estado do job e os resultados em MongoDB.
 - Encaminhar falhas ao **Retry System** e propagar o estado final (sucesso/falha).
 - **Relaiar** as notificações **SSE** ao dashboard, inclusive os eventos emitidos pelos contêineres FastAPI.
@@ -196,8 +202,8 @@ graph TD
 
 **Responsabilidades**:
 - Expor o **endpoint de upload** de áudio, recebendo as requisições roteadas pelo gateway (ingestão via API, nunca acesso direto aos workers).
-- Validar payload (formato de áudio, metadados) com Pydantic.
-- Criar o registro de job e delegar o início/sequenciamento do pipeline ao gateway/orquestrador.
+- Validar payload (formato de áudio, tamanho de arquivo, metadados) com Pydantic **antes** de aceitar o Job; em caso de payload inválido, **rejeitar a requisição sem criar documento em `call_jobs`**, preservando o estado do sistema e retornando erro de validação indicando o campo/regra violada.
+- Criar o registro de job (`call_jobs` com `status = RECEIVED` e `audioRef` presente) e **retornar ao cliente o `call_jobs._id` criado** na confirmação do upload; delegar o início/sequenciamento do pipeline ao gateway/orquestrador.
 - Emitir eventos **SSE** de progresso, relaiados ao dashboard **através do gateway Node.js**.
 - Receber **callbacks** do MongoDB/gateway sobre mudança de estado dos jobs.
 
@@ -246,8 +252,9 @@ graph TD
 
 **Responsabilidades (alto nível)**:
 - Consumir da AI Queue.
-- Interpretar o texto diarizado via LLMs locais (ex.: Qwen 4B).
-- Validar regras de negócio e gerar **JSON object**.
+- **Consultar o RAG (Base de Scripts dos Atendentes)** para obter o contexto do script de referência (trechos/protocolos relevantes) **antes** de gerar a decisão, fundamentando a validação de aderência ao roteiro.
+- Interpretar o texto diarizado via LLMs locais (ex.: Qwen 4B), combinando-o com o contexto de script recuperado do RAG.
+- Validar regras de negócio (incluindo aderência ao script de atendimento) e gerar **JSON object**, registrando as referências de script que fundamentaram cada veredicto.
 - Disparar notificações em tempo real para a UI via SSE; sinalizar `Fail` em erro.
 
 ### Componente 8: Retry System
@@ -275,6 +282,18 @@ graph TD
 **Responsabilidades**:
 - Manter conexões SSE por job/sessão de auditoria.
 - Emitir eventos de progresso e resultado (ex.: `NOISE_DONE`, `TRANSCRIPT_DONE`, `AI_DONE`, `FAILED`).
+
+### Componente 11: RAG — Base de Scripts dos Atendentes (conceitual)
+
+**Propósito**: Indexar/armazenar os **scripts e protocolos de atendimento de referência** (o roteiro que os atendentes deveriam seguir) e fornecer **recuperação de contexto** — trechos relevantes do script — ao AI Worker, para fundamentar a **validação de aderência ao roteiro**. Esta é uma peça **conceitual** nesta fatia: os internals de embeddings/vector-store não são especificados aqui.
+
+**Responsabilidades (alto nível)**:
+- Manter uma base de conhecimento dos scripts/protocolos de atendimento de referência (versões/trechos), indexada para recuperação.
+- Fornecer ao AI Worker, sob demanda, os trechos de script mais relevantes ao contexto da chamada para fundamentar a avaliação de regras de aderência.
+- Operar como **fonte de recuperação (somente leitura) exclusiva da lane de IA** — **não** é produtor de mensagens para o `direct-exchange` nem participa das lanes de Ruído/Transcrição.
+- Ser **open source** e executar **local/offline**, sem dependências de serviços externos de nuvem (consistente com a restrição 100% open source local/offline).
+
+> **Nota (nível conceitual)**: os mecanismos internos de embeddings, chunking e vector-store ficam fora do escopo desta primeira fatia; o RAG é tratado em alto nível, como as demais lanes/workers (Ruído/Transcrição/IA). O detalhamento do stack concreto será definido em fase posterior.
 
 ---
 
@@ -339,14 +358,30 @@ Objeto JSON estruturado gerado pelo AI Worker.
 |-------|-------------------|-----------|
 | `jobId` | ObjectId | Referência ao `call_jobs` |
 | `decision` | object | JSON estruturado com validação de regras de negócio |
-| `rulesEvaluated` | array | Regras avaliadas e seus veredictos |
+| `rulesEvaluated` | array | Regras avaliadas e seus veredictos (inclui aderência ao script) |
+| `scriptContextRefs` | array | Referências/trechos de script recuperados do RAG que fundamentaram a decisão/avaliação de regras (ex.: `scriptId`, `version`, trecho/chunk) |
 | `summary` | string | Resumo auditável (sem PII) |
 | `model` | string | Modelo/versão usado (ex.: Qwen 4B / Mistral 24B) |
 | `createdAt` | datetime | Carimbo de tempo |
 
-**Regras de validação (alto nível)**: `decision` deve ser um objeto JSON válido conforme o schema de negócio; derivado de `transcripts` com `piiMasked = true`.
+**Regras de validação (alto nível)**: `decision` deve ser um objeto JSON válido conforme o schema de negócio; derivado de `transcripts` com `piiMasked = true`. Todo veredicto de **aderência ao script** em `rulesEvaluated` deve ser rastreável a pelo menos uma entrada de `scriptContextRefs` (contexto recuperado do RAG que o fundamentou).
 
-### Coleção 5: `retry_metadata` (Retry / Dead-Letter)
+### Coleção 5: `attendant_scripts` (Base de Scripts dos Atendentes — conceitual)
+
+Base de conhecimento dos scripts/protocolos de atendimento de referência que alimenta o RAG. Descrita em **nível conceitual** nesta fatia — os internals de embeddings/vector-store não são especificados.
+
+| Campo | Tipo (conceitual) | Descrição |
+|-------|-------------------|-----------|
+| `scriptId` | string | Identificador do script/protocolo de atendimento |
+| `version` | string | Versão do roteiro de referência |
+| `content` | string | Conteúdo do script de referência (texto integral) |
+| `chunks` | array | Trechos indexáveis do script para recuperação (conceitual) |
+| `active` | boolean | Indica se a versão está vigente para consulta |
+| `createdAt` / `updatedAt` | datetime | Carimbos de tempo |
+
+**Regras de validação (alto nível)**: é **fonte de recuperação (somente leitura) para a lane de IA** — não é alimentada pelos workers do pipeline; os `scriptContextRefs` persistidos em `ai_decisions` referenciam entradas desta coleção (`scriptId`/`version`/trecho).
+
+### Coleção 6: `retry_metadata` (Retry / Dead-Letter)
 
 Metadados de tentativas e falhas terminais.
 
@@ -419,6 +454,7 @@ graph TD
 - **Aresta `Fail` por lane**: qualquer worker (Ruído, Transcrição, IA) que falhe encaminha a mensagem ao **Retry System**, em vez de descartá-la.
 - **Política de retry**: o Retry System incrementa o contador de tentativas, aplica backoff e **re-publica** a mensagem na fila de origem via `direct-exchange`.
 - **Dead-letter**: ao atingir `maxAttempts`, a mensagem vai para a **Dead Letter Queue**, o job é marcado como `FAILED` em MongoDB e o metadata é registrado em `retry_metadata`.
+- **Routing key inválida**: uma mensagem publicada com routing key fora do conjunto válido `{routingKey.audio, routingKey.transcript, routingKey.AI}` **não** é entregue a nenhuma das filas (Noise/Transcript/AI); em vez de descarte silencioso, ela é encaminhada à **Dead Letter Queue**, preservando a mensagem.
 - **Notificação de falha**: falhas terminais e progresso são comunicados ao dashboard via **SSE**.
 - **Idempotência**: o reprocessamento não deve duplicar resultados — o estado por lane (`workflow_states`) é a fonte de verdade para evitar efeitos colaterais repetidos.
 - **Callback**: o MongoDB emite callback ao Gateway/Orquestrador Node.js para refletir mudanças de estado, que são relaiadas ao dashboard.
@@ -462,7 +498,8 @@ Testes do endpoint de upload (ingestão sempre via API/gateway) cobrindo valida�
 
 - **Desempenho (RTF < 1.0)**: o Real-Time Factor de cada etapa de processamento deve ficar abaixo de 1.0 (processar mais rápido que o tempo de áudio) para viabilidade da PoC.
 - **Fronteira de PII/LGPD**: nenhum dado pessoal pode atravessar a fronteira da etapa de NLP; o AI Worker e a persistência de transcrição operam **somente sobre texto já mascarado** (`piiMasked = true`).
-- **Operação offline/local**: todo o stack é 100% open source e executa localmente, sem dependências de serviços externos de nuvem.
+- **Operação offline/local**: todo o stack é 100% open source e executa localmente, sem dependências de serviços externos de nuvem — **inclusive o RAG** sobre os scripts de atendimento, que indexa e recupera o contexto do roteiro local/offline.
+- **Fundamentação da validação de aderência ao script**: a lane de IA usa um **RAG local/offline sobre os scripts dos atendentes** para fundamentar a verificação sistemática de aderência ao roteiro; veredictos de aderência são rastreáveis ao contexto de script recuperado (`scriptContextRefs`).
 - **Desacoplamento e escalabilidade**: filas por lane permitem escalar workers independentemente conforme o gargalo.
 - **Tolerância a falhas**: o Retry System + Dead Letter Queue garantem que nenhuma mensagem seja perdida silenciosamente.
 - **Preferência de formato**: áudio não comprimido (`.WAV`) é preferido para maximizar qualidade da transcrição.
@@ -518,3 +555,8 @@ reprocessar uma mensagem após falha não produz resultados duplicados para o me
 toda transição para `DONE` ou `FAILED` resulta em uma notificação SSE ao dashboard.
 
 **Validates: Requirements 9.1, 9.2**
+
+### Property 10: Fundamentação no script via RAG
+todo veredicto de **aderência ao script** registrado em `ai_decisions.rulesEvaluated` é fundamentado em contexto de script recuperado do RAG — ou seja, um `ai_decisions` que referencie uma regra de aderência ao roteiro inclui ao menos um `scriptContextRef` — e o AI Worker só deriva a decisão **após** recuperar o contexto do script de referência da Base de Scripts dos Atendentes (fonte de recuperação local/offline, somente leitura).
+
+**Validates: Requirements 13.1, 13.3, 12.3**

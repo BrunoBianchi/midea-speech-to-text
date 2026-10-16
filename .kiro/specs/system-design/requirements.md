@@ -19,6 +19,8 @@ Os internals de ML de cada worker (DeepFilterNet3, WhisperX/Whisper, Pyannote, L
 - **Noise_Worker**: Worker conceitual de redução de ruído (lane NOISE).
 - **Transcript_Worker**: Worker conceitual de transcrição, diarização e mascaramento de PII (lane TRANSCRIPT).
 - **AI_Worker**: Worker conceitual de decisão por IA que gera objeto JSON estruturado (lane AI).
+- **RAG**: Componente de Retrieval-Augmented Generation que indexa os scripts/protocolos de atendimento de referência e fornece recuperação de contexto (somente leitura) ao AI_Worker.
+- **Attendant_Script** (ou Script de Atendimento): O roteiro/protocolo que os atendentes deveriam seguir, armazenado na base `attendant_scripts` e consultado via RAG.
 - **Retry_System**: Componente que recebe as arestas `Fail` das lanes, aplica política de retry e encaminha à Dead Letter Queue.
 - **Dead_Letter_Queue (DLQ)**: Fila de mensagens cujas tentativas se esgotaram.
 - **MongoDB**: Persistência durável de jobs, estados por lane, resultados e metadados.
@@ -40,7 +42,7 @@ Os internals de ML de cada worker (DeepFilterNet3, WhisperX/Whisper, Pyannote, L
 
 1. WHEN um upload de áudio é recebido no endpoint de upload do API_Container, THE API_Container SHALL validar o payload (formato de áudio e metadados) usando Pydantic antes de aceitar o Job.
 2. WHEN um upload de áudio é recebido no endpoint de upload do API_Container, THE API_Container SHALL aceitar apenas arquivos cujo formato esteja entre os formatos de áudio suportados, com tamanho de arquivo entre 1 byte e 500 MB e cada campo textual de metadados com no máximo 1024 caracteres.
-3. IF o payload de upload é inválido (formato de áudio não suportado, tamanho de arquivo fora da faixa de 1 byte a 500 MB, ou metadados não conformes), THEN THE API_Container SHALL rejeitar a requisição sem criar documento em `call_jobs`, retornar uma resposta de erro de validação indicando o campo ou regra violada, e preservar inalterado o estado do System.
+3. IF o payload de upload é inválido (formato de áudio não suportado, ou metadados não conformes), THEN THE API_Container SHALL rejeitar a requisição sem criar documento em `call_jobs`, retornar uma resposta de erro de validação indicando o campo ou regra violada, e preservar inalterado o estado do System.
 4. WHEN um upload válido é aceito, THE System SHALL criar, em até 5 segundos, um documento em `call_jobs` com um `_id` único, `status` igual a `RECEIVED` e `audioRef` presente apontando para o áudio armazenado.
 5. WHEN um upload válido é aceito, THE API_Container SHALL retornar ao cliente uma resposta de confirmação contendo o `call_jobs._id` criado.
 6. THE System SHALL exigir que todo áudio processado possua um `call_jobs._id` criado por um endpoint de upload da API, de modo que nenhum Noise_Worker, Transcript_Worker ou AI_Worker receba trabalho sem passar pelo Gateway e pelo API_Container.
@@ -184,3 +186,17 @@ Os internals de ML de cada worker (DeepFilterNet3, WhisperX/Whisper, Pyannote, L
 3. WHEN o AI_Worker gera um documento `ai_decisions`, THE AI_Worker SHALL registrar em `ai_decisions.rulesEvaluated` uma entrada para cada regra de negócio avaliada, contendo o identificador da regra e seu veredicto restrito aos valores `PASS`, `FAIL` ou `NOT_APPLICABLE`.
 4. WHEN o AI_Worker gera um documento `ai_decisions`, THE AI_Worker SHALL produzir `ai_decisions.summary` como texto com no máximo 2000 caracteres, derivado exclusivamente de texto com `piiMasked` igual a `true`.
 5. THE AI_Worker SHALL garantir que `ai_decisions.summary` não contenha nenhum PII (ex.: CPF, endereço, telefone), de modo que o resumo permaneça em conformidade com a LGPD.
+6. WHEN o AI_Worker registra em `ai_decisions.rulesEvaluated` ao menos uma regra de aderência ao script de atendimento com veredicto igual a `PASS` ou `FAIL`, THE AI_Worker SHALL incluir em `ai_decisions.scriptContextRefs` ao menos uma referência de contexto de script recuperado do RAG e SHALL associar cada veredicto de aderência ao script a pelo menos uma entrada de `ai_decisions.scriptContextRefs`.
+
+### Requirement 13: Recuperação de Contexto do Script via RAG
+
+**User Story:** Como auditor de QA, quero que a validação de aderência ao roteiro seja fundamentada no script de referência recuperado via RAG, para que os veredictos de aderência sejam rastreáveis e auditáveis.
+
+#### Acceptance Criteria
+
+1. WHEN o AI_Worker vai gerar a decisão para um Job, THE AI_Worker SHALL consultar o RAG e recuperar o contexto do Attendant_Script de referência relevante antes de avaliar as regras de aderência ao roteiro.
+2. THE RAG SHALL operar em modo somente leitura e local/offline, sem realizar chamadas de rede a serviços externos de nuvem durante a recuperação de contexto.
+3. WHEN o AI_Worker registra em `ai_decisions.rulesEvaluated` um veredicto de aderência ao Attendant_Script, THE AI_Worker SHALL incluir em `ai_decisions.scriptContextRefs` ao menos uma referência ao trecho/versão de script recuperado do RAG que fundamentou esse veredicto.
+4. IF o RAG não retorna nenhum contexto de Attendant_Script aplicável (base `attendant_scripts` vazia ou sem correspondência), THEN THE AI_Worker SHALL registrar os veredictos de aderência ao roteiro em `ai_decisions.rulesEvaluated` com o valor `NOT_APPLICABLE`, registrar a ausência de contexto recuperado e não criar nenhuma entrada em `ai_decisions.scriptContextRefs`.
+5. THE System SHALL tratar a base `attendant_scripts` como fonte de recuperação (somente leitura) exclusiva da lane AI, de modo que nenhum Noise_Worker, Transcript_Worker ou AI_Worker escreva nessa base e que essa base não produza mensagens para o Exchange.
+6. WHERE a base `attendant_scripts` disponibiliza múltiplas versões de um mesmo Attendant_Script, THE AI_Worker SHALL registrar em cada entrada de `ai_decisions.scriptContextRefs` o identificador e a versão do trecho de script recuperado do RAG que fundamentou o veredicto.
