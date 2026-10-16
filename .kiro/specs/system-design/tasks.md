@@ -77,7 +77,7 @@ graph TD
 
 ## Tasks
 
-- [-] 1. Preparar scaffolding de projeto e frameworks de teste
+- [x] 1. Preparar scaffolding de projeto e frameworks de teste
   - Criar a estrutura `App/Gateway/src` (Node.js) e `App/Backend/app` (FastAPI) com módulos esqueleto e um diretório compartilhado de contratos (`App/shared` para nomes de routing keys, enums de status/lane/state e eventos SSE).
   - Configurar o framework de testes Python: adicionar `pytest`, `pytest-asyncio` e `hypothesis` ao `App/Backend/requirements.txt` e criar `App/Backend/pytest.ini` com um teste de fumaça.
   - Configurar o framework de testes Node.js: adicionar `vitest` e `fast-check` como devDependencies no `package.json` e criar `App/Gateway/vitest.config.*` com um teste de fumaça.
