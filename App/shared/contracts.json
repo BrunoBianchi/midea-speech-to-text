@@ -1,0 +1,33 @@
+{
+  "$comment": "Single source of truth for cross-language contracts (routing keys, status/lane/state enums, SSE events). Consumed by the Node.js Gateway (contracts.js) and the Python workers/backend (contracts.py). Keep values identical across all language modules.",
+  "routingKeys": {
+    "AUDIO": "routingKey.audio",
+    "TRANSCRIPT": "routingKey.transcript",
+    "AI": "routingKey.AI"
+  },
+  "status": {
+    "RECEIVED": "RECEIVED",
+    "NOISE": "NOISE",
+    "TRANSCRIPT": "TRANSCRIPT",
+    "AI": "AI",
+    "DONE": "DONE",
+    "FAILED": "FAILED"
+  },
+  "lane": {
+    "NOISE": "NOISE",
+    "TRANSCRIPT": "TRANSCRIPT",
+    "AI": "AI"
+  },
+  "state": {
+    "QUEUED": "QUEUED",
+    "PROCESSING": "PROCESSING",
+    "SUCCESS": "SUCCESS",
+    "FAILED": "FAILED"
+  },
+  "sseEvents": {
+    "NOISE_DONE": "NOISE_DONE",
+    "TRANSCRIPT_DONE": "TRANSCRIPT_DONE",
+    "AI_DONE": "AI_DONE",
+    "FAILED": "FAILED"
+  }
+}
